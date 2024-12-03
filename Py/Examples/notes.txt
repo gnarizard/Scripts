@@ -27,6 +27,7 @@ To access internal resources or perform scripting-related tasks, Python provides
 #######################################################
 1. os: Interact with the Operating System
 Navigate the file system, run commands, or manage environment variables.
+
 import os
 
 # Get current working directory
@@ -41,6 +42,7 @@ os.system("echo 'Hello, World!'")
 ################################################
 2. sys: System-Specific Parameters
 Access command-line arguments or control Python’s runtime environment.
+
 import sys
 
 # Get Python version
@@ -52,6 +54,7 @@ sys.exit(0)
 ###################################################
 3. subprocess: Execute Shell Commands
 A more robust way to run shell commands and capture their output.
+
 import subprocess
 
 result = subprocess.run(["ls", "-l"], capture_output=True, text=True)
@@ -60,6 +63,7 @@ print(result.stdout)
 #####################################################
 4. shutil: File Operations
 Copy, move, or delete files and directories.
+
 import shutil
 
 # Copy a file
@@ -68,6 +72,7 @@ shutil.copy("source.txt", "destination.txt")
 ########################################################
 5. argparse: Command-Line Argument Parsing
 For creating user-friendly CLI tools.
+
 import argparse
 
 parser = argparse.ArgumentParser(description="A sample script.")
@@ -95,6 +100,7 @@ print(f"Hostname: {hostname}, IP: {ip_address}")
 ########################################################
 8. json & yaml: Handle Configuration Files
 Read/write configuration data in JSON or YAML format.
+
 import json
 
 config = {"user": "Ryan", "role": "Cybersecurity"}

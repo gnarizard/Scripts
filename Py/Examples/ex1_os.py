@@ -1,4 +1,3 @@
-# File and Dir manager
 # os: Interact with the Operating System
 # navigate the file system, run commands, 
 # or manage environment variables.
