@@ -330,10 +330,12 @@ for h in "${HYPOS[@]}"; do
   t="${h#*:}"
   QUERIES+=("$t vulnerability CVE")
 done
-QUERIES=($(printf "%s\n" "${QUERIES[@]}" | uniq_lines | head -n 8))
-NHUNTS=($(printf "%s\n" "${NHUNTS[@]}" | uniq_lines | head -n 8))
-RAT=($(printf "%s\n" "${RAT[@]}" | uniq_lines | head -n 6))
-CVESEED=($(printf "%s\n" "${CVESEED[@]}" | uniq_lines | head -n 8))
+# preserve whole lines (no word splitting)
+mapfile -t QUERIES < <(printf '%s\n' "${QUERIES[@]}" | uniq_lines | head -n 8)
+mapfile -t NHUNTS  < <(printf '%s\n' "${NHUNTS[@]}"  | uniq_lines | head -n 8)
+mapfile -t RAT     < <(printf '%s\n' "${RAT[@]}"     | uniq_lines | head -n 6)
+mapfile -t CVESEED < <(printf '%s\n' "${CVESEED[@]}" | uniq_lines | head -n 8)
+
 
 # ------------- report (Markdown) -------------
 echo "# Web Fingerprinter (curl edition)"
