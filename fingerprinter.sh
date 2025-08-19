@@ -16,7 +16,7 @@ TIMEOUT=8
 MAX_ASSETS=12
 ENGINE_PROBES=18            # cap engine endpoint guesses
 CRAWL_PAGES=6               # depth-1 pages to fetch (links found on /)
-UA="webfp/0.4 (+read-only curl probes)"
+UA="webfp/0.5 (+read-only curl probes)"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -37,6 +37,14 @@ ENGINE_RX='js2py|pyimport|evaljs|JsException|JsObjectWrapper|quickjs|duktape|vm2
 LIB_RX='js2py|quickjs|duktape|vm2|contextify|jinja2|mako|twig|blade|handlebars|mustache|ejs|pug|nunjucks|pydantic|marshmallow|express|koa|hapi|fastify|starlette|werkzeug|flask|django|falcon|rails|laravel|spring|asp\.?net|\.AspNetCore|undertow|jetty|coyote|gunicorn|uvicorn|hypercorn'
 VER_RX='(version|ver|ng-version|x-aspnet-version)[\"\x27=: ]+([0-9]+\.[0-9.]+)'
 
+# security headers we’ll surface
+SEC_HDRS=( \
+  "Content-Security-Policy" "X-Frame-Options" "Strict-Transport-Security" \
+  "Cross-Origin-Opener-Policy" "Cross-Origin-Embedder-Policy" "Cross-Origin-Resource-Policy" \
+  "Referrer-Policy" "Permissions-Policy" "X-Content-Type-Options" \
+  "Access-Control-Allow-Origin" "Access-Control-Allow-Credentials" \
+)
+
 # normalize base URL (hide default ports)
 default_port() { [[ "$1" == "https" ]] && echo 443 || echo 80; }
 if [[ "$PORT" == "$(default_port "$SCHEME")" ]]; then
@@ -48,6 +56,8 @@ fi
 # ------------- helpers -------------
 curl_head() { curl -ksS -m "$TIMEOUT" -A "$UA" -I "$1"; }
 curl_get()  { curl -ksS -m "$TIMEOUT" -A "$UA" -D "$2.hdr" -o "$2.body" -w "%{http_code}" "$1"; }
+# cache-busting variant for static (avoid 304 masking)
+curl_get_nc(){ curl -ksS -m "$TIMEOUT" -A "$UA" -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -D "$2.hdr" -o "$2.body" -w "%{http_code}" "$1"; }
 curl_post() { curl -ksS -m "$TIMEOUT" -A "$UA" -D "$3.hdr" -o "$3.body" -H "$2" --data-binary @"$3.data" -w "%{http_code}" "$1"; }
 curl_post_json() { curl -ksS -m "$TIMEOUT" -A "$UA" -D "$3.hdr" -o "$3.body" -H 'Content-Type: application/json' -d "$2" -w "%{http_code}" "$1"; }
 curl_options() { curl -ksS -m "$TIMEOUT" -A "$UA" -X OPTIONS -i "$1"; }
@@ -61,13 +71,14 @@ abspath() { # resolve absolute URL
 
 title_of() { grep -i -o '<title[^>]*>[^<]*' "$1" | sed -E 's/.*>//' | head -n1; }
 
-hr() { echo -e "\n---\n"; }
 print_kv() { printf "**%s:** %s\n" "$1" "$2"; }
 uniq_lines() { awk '!seen[$0]++'; }
 
 # ------------- data stores -------------
 declare -A HEADERS
+declare -A SEC_HEADERS
 COOKIES=()
+COOKIE_FLAGS=()   # parallel array: "name: flags"
 ASSETS=()
 LINKS=()
 ERRS_KEYS=()
@@ -90,11 +101,26 @@ for h in "${hdr_lines[@]}"; do
   elif [[ "$h" =~ ^[Dd]ate: ]]; then HEADERS[date]="${h#*: }"
   elif [[ "$h" =~ ^[Cc]ontent-[Tt]ype: ]]; then HEADERS[content_type]="${h#*: }"
   elif [[ "$h" =~ ^[Ss]et-[Cc]ookie: ]]; then
+    # collect cookie names and flags
     ck=${h#*: }
-    while IFS= read -r part; do
-      nm=$(echo "$part" | cut -d';' -f1 | sed 's/^[ ]*//')
-      [[ "$nm" == *=* ]] && COOKIES+=("$nm")
+    while IFS= read -r line; do
+      line="${line# }"
+      nm=$(echo "$line" | cut -d';' -f1 | sed 's/^[ ]*//')
+      [[ "$nm" != *=* ]] && continue
+      COOKIES+=("$nm")
+      # flags after the first ;
+      flags=$(echo "$line" | cut -d';' -f2- | sed 's/^ *//; s/; */; /g')
+      name=$(echo "$nm" | cut -d'=' -f1)
+      [[ -n "$flags" ]] && COOKIE_FLAGS+=("$name: $flags")
     done < <(echo "$ck" | tr -d '\r' | tr ',' '\n')
+  else
+    # capture security headers of interest
+    for key in "${SEC_HDRS[@]}"; do
+      # case-insensitive compare
+      if [[ "${h,,}" == "${key,,}:"* ]]; then
+        SEC_HEADERS[$key]="${h#*: }"
+      fi
+    done
   fi
 done
 
@@ -138,6 +164,20 @@ if [[ -s "$sitemap_id.body" ]]; then
 fi
 LINKS=($(printf "%s\n" "${LINKS[@]}" | uniq_lines | head -n "$CRAWL_PAGES"))
 
+# OPTIONS on base to show Allow + (potentially) CORS bits
+opt_id="$TMPDIR/options"
+curl_options "$BASE" > "$opt_id" || true
+ALLOW_METHODS="$(grep -i '^Allow:' "$opt_id" 2>/dev/null | head -n1 | sed 's/^[Aa]llow:[ ]*//')"
+# merge OPTION response headers into SEC_HEADERS if present
+while IFS= read -r oh; do
+  key=$(echo "$oh" | cut -d: -f1)
+  val=$(echo "$oh" | cut -d: -f2- | sed 's/^ //')
+  for k in "${SEC_HDRS[@]}"; do
+    if [[ "${key,,}" == "${k,,}" ]]; then SEC_HEADERS[$k]="$val"; fi
+  done
+done < <(grep -E '^[A-Za-z0-9\-]+:' "$opt_id" | tr -d '\r')
+
+# favicon sha1 (we keep just sha1 here to avoid deps)
 fav_id="$TMPDIR/fav"
 curl_get "${BASE}favicon.ico" "$fav_id" >/dev/null || true
 FAV_SHA=""
@@ -149,7 +189,7 @@ fi
 sm_count=0
 for a in "${ASSETS[@]}"; do
   id="$TMPDIR/a$(echo -n "$a" | md5sum | cut -d' ' -f1)"
-  curl_get "$a" "$id" >/dev/null || true
+  curl_get_nc "$a" "$id" >/dev/null || true
   [[ -s "$id.body" ]] || continue
   # version hints
   while IFS= read -r m; do
@@ -161,7 +201,7 @@ for a in "${ASSETS[@]}"; do
     sm=$(grep -Eo '#[@]\s*sourceMappingURL=\S+' "$id.body" | awk -F= '{print $2}' | head -n1)
     smu=$(abspath "$(dirname "$a")/$sm")
     sm_id="$TMPDIR/sm$(echo -n "$smu" | md5sum | cut -d' ' -f1)"
-    curl_get "$smu" "$sm_id" >/dev/null || true
+    curl_get_nc "$smu" "$sm_id" >/dev/null || true
     if [[ -s "$sm_id.body" && $sm_count -lt 3 ]]; then
       SOURCEMAPS+=("$smu")
       SOURCEMAPS_CONTENT+=("$(head -c 400 "$sm_id.body")")
@@ -174,7 +214,7 @@ for a in "${ASSETS[@]}"; do
   done < <(grep -Eo "fetch\(['\"][^'\"]+|axios\.(get|post|put|patch|delete)\(['\"][^'\"]+|XMLHttpRequest\(\)\.open\(['\"][A-Z]+['\"],\s*['\"][^'\"]+" "$id.body" 2>/dev/null \
             | sed -E "s/.*\(['\"]([^'\"]+).*/\1/" | head -n 80)
 done
-JS_URLS=($(printf "%s\n" "${JS_URLS[@]}" | uniq_lines))
+JS_URLS=($(printf "%s\n" "${JS_URLS[@]}" | uniq_lines | head -n 12))
 
 # ------------- engine probes (light) -------------
 # build candidates
@@ -336,7 +376,6 @@ mapfile -t NHUNTS  < <(printf '%s\n' "${NHUNTS[@]}"  | uniq_lines | head -n 8)
 mapfile -t RAT     < <(printf '%s\n' "${RAT[@]}"     | uniq_lines | head -n 6)
 mapfile -t CVESEED < <(printf '%s\n' "${CVESEED[@]}" | uniq_lines | head -n 8)
 
-
 # ------------- report (Markdown) -------------
 echo "# Web Fingerprinter (curl edition)"
 print_kv "Target" "$BASE"
@@ -344,17 +383,47 @@ print_kv "Target" "$BASE"
 [[ -n "${HEADERS[server]:-}" ]] && print_kv "Server" "${HEADERS[server]}"
 [[ -n "${HEADERS[content_type]:-}" ]] && print_kv "Content-Type" "${HEADERS[content_type]}"
 [[ -n "$FAV_SHA" ]] && print_kv "Favicon (sha1)" "$FAV_SHA"
+[[ -n "${ALLOW_METHODS:-}" ]] && print_kv "Allow (OPTIONS /)" "$ALLOW_METHODS"
 
+# security headers table (only print present ones)
+present_sec=()
+for k in "${SEC_HDRS[@]}"; do
+  [[ -n "${SEC_HEADERS[$k]:-}" ]] && present_sec+=("$k|${SEC_HEADERS[$k]}")
+done
+if [[ "${#present_sec[@]}" -gt 0 ]]; then
+  echo -e "\n## Security headers"
+  echo "| Header | Value |"
+  echo "|--------|-------|"
+  for row in "${present_sec[@]}"; do
+    echo "| ${row%%|*} | ${row#*|} |"
+  done
+fi
+
+# cookies (names + flags)
 if [[ "${#COOKIES[@]}" -gt 0 ]]; then
   names=$(printf "%s\n" "${COOKIES[@]}" | sed 's/;.*//' | awk -F= '{print $1}' | paste -sd' ' -)
   echo -e "\n**Cookies (names):** $names"
+  if [[ "${#COOKIE_FLAGS[@]}" -gt 0 ]]; then
+    echo -e "\n**Cookie flags**"
+    for cf in "${COOKIE_FLAGS[@]}"; do
+      echo "- $cf"
+    done
+  fi
 fi
 
+# assets
 if [[ "${#ASSETS[@]}" -gt 0 ]]; then
   echo -e "\n**Assets (sample):**"
   for a in "${ASSETS[@]}"; do echo "- $a"; done
 fi
 
+# JS endpoints
+if [[ "${#JS_URLS[@]}" -gt 0 ]]; then
+  echo -e "\n**JS Endpoints (from frontend):**"
+  for u in "${JS_URLS[@]}"; do echo "- $u"; done
+fi
+
+# sourcemaps
 if [[ "${#SOURCEMAPS[@]}" -gt 0 ]]; then
   echo -e "\n**Sourcemaps (sample):**"
   for i in "${!SOURCEMAPS[@]}"; do
@@ -362,15 +431,18 @@ if [[ "${#SOURCEMAPS[@]}" -gt 0 ]]; then
   done
 fi
 
+# version hints
 if [[ "${#VERSION_HINTS[@]}" -gt 0 ]]; then
   echo -e "\n**Version hints:** $(printf "%s " "${VERSION_HINTS[@]}")"
 fi
 
+# hypotheses
 if [[ "${#HYPOS[@]}" -gt 0 ]]; then
   echo -e "\n## Hypotheses"
   for h in "${HYPOS[@]}"; do echo "- $h"; done
 fi
 
+# error snippets
 if [[ "${#ERRS_KEYS[@]}" -gt 0 ]]; then
   echo -e "\n## Error snippets (engine/context leaks)"
   for k in "${ERRS_KEYS[@]}"; do
@@ -381,6 +453,7 @@ if [[ "${#ERRS_KEYS[@]}" -gt 0 ]]; then
   done
 fi
 
+# context
 if [[ "${#RAT[@]}" -gt 0 || "${#NHUNTS[@]}" -gt 0 || "${#QUERIES[@]}" -gt 0 || "${#CVESEED[@]}" -gt 0 ]]; then
   echo -e "\n## Context"
   if [[ "${#RAT[@]}" -gt 0 ]]; then
