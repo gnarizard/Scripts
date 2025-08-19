@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fingerprinter.sh — ultra-light web fingerprinting via curl (ENV ONLY)
+# fingerprinter.sh — ultra-light web fingerprinting via curl
 # Usage:
 #   export DOMAIN=example.com; export PORT=8000
 #   ./fingerprinter.sh                # defaults to http://DOMAIN:PORT/
@@ -377,7 +377,7 @@ mapfile -t RAT     < <(printf '%s\n' "${RAT[@]}"     | uniq_lines | head -n 6)
 mapfile -t CVESEED < <(printf '%s\n' "${CVESEED[@]}" | uniq_lines | head -n 8)
 
 # ------------- report (Markdown) -------------
-echo "# Web Fingerprinter (curl edition)"
+echo "# Web Fingerprinter"
 print_kv "Target" "$BASE"
 [[ -n "$TITLE" ]] && print_kv "Title" "$TITLE"
 [[ -n "${HEADERS[server]:-}" ]] && print_kv "Server" "${HEADERS[server]}"
