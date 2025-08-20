@@ -48,11 +48,12 @@ fi
 # ------------- helpers -------------
 curl_head() { curl -ksS -m "$TIMEOUT" -A "$UA" -I "$1"; }
 curl_get()  { curl -ksS -m "$TIMEOUT" -A "$UA" -D "$2.hdr" -o "$2.body" -w "%{http_code}" "$1"; }
+curl_get_nc(){ curl -ksS -m "$TIMEOUT" -A "$UA" -H 'Cache-Control: no-cache' -D "$2.hdr" -o "$2.body" -w "%{http_code}" "$1"; }
 curl_post() { curl -ksS -m "$TIMEOUT" -A "$UA" -D "$3.hdr" -o "$3.body" -H "$2" --data-binary @"$3.data" -w "%{http_code}" "$1"; }
 curl_post_json() { curl -ksS -m "$TIMEOUT" -A "$UA" -D "$3.hdr" -o "$3.body" -H 'Content-Type: application/json' -d "$2" -w "%{http_code}" "$1"; }
-curl_options() { curl -ksS -m "$TIMEOUT" -A "$UA" -X OPTIONS -i "$1"; }
+curl_options_headers() { curl -ksS -m "$TIMEOUT" -A "$UA" -X OPTIONS -D "$1" -o /dev/null "$BASE"; }
 
-abspath() { # resolve absolute URL
+abspath() {
   local url="$1"
   if [[ "$url" =~ ^https?:// ]]; then echo "$url"; else
     if [[ "$url" == /* ]]; then echo "${BASE%/}$url"; else echo "${BASE}$url"; fi
@@ -61,13 +62,14 @@ abspath() { # resolve absolute URL
 
 title_of() { grep -i -o '<title[^>]*>[^<]*' "$1" | sed -E 's/.*>//' | head -n1; }
 
-hr() { echo -e "\n---\n"; }
 print_kv() { printf "**%s:** %s\n" "$1" "$2"; }
 uniq_lines() { awk '!seen[$0]++'; }
 
 # ------------- data stores -------------
 declare -A HEADERS
+declare -A HEADERS_SEC=()
 COOKIES=()
+COOKIE_FLAGS=()
 ASSETS=()
 LINKS=()
 ERRS_KEYS=()
@@ -80,9 +82,9 @@ HITS_COOKIE=()
 ENGINE_MARKERS=()
 JS_URLS=()
 
-# new: node inference flags
-SOFT_NODE_CLUE=0   # frontend-only hints (process.env/require/module.exports) — never enough alone
-NODE_HARD_HINT=0   # headers/cookies/error-markers that strongly imply Node
+# node inference flags
+SOFT_NODE_CLUE=0
+NODE_HARD_HINT=0
 
 # ------------- base fetch -------------
 base_id="$TMPDIR/base"
@@ -94,10 +96,7 @@ for h in "${hdr_lines[@]}"; do
     HEADERS[server]="${h#*: }"
   elif [[ "$h" =~ ^[Xx]-[Pp]owered-[Bb]y: ]]; then
     HEADERS[x_powered_by]="${h#*: }"
-    # hard Node signal via header
-    if echo "${HEADERS[x_powered_by]}" | grep -Eqi 'express|koa|hapi|fastify|nest'; then
-      NODE_HARD_HINT=1
-    fi
+    if echo "${HEADERS[x_powered_by]}" | grep -Eqi 'express|koa|hapi|fastify|nest'; then NODE_HARD_HINT=1; fi
   elif [[ "$h" =~ ^[Dd]ate: ]]; then
     HEADERS[date]="${h#*: }"
   elif [[ "$h" =~ ^[Cc]ontent-[Tt]ype: ]]; then
@@ -107,7 +106,6 @@ for h in "${hdr_lines[@]}"; do
     while IFS= read -r part; do
       nm=$(echo "$part" | cut -d';' -f1 | sed 's/^[ ]*//')
       [[ "$nm" == *=* ]] && COOKIES+=("$nm")
-      # hard Node signal via cookie name
       if echo "$nm" | grep -qi '^connect\.sid='; then NODE_HARD_HINT=1; fi
     done < <(echo "$ck" | tr -d '\r' | tr ',' '\n')
   fi
@@ -116,20 +114,49 @@ done
 TITLE="$(title_of "$base_id.body" 2>/dev/null || true)"
 [[ -n "${HEADERS[server]:-}" ]] && HITS_HEADER+=("server:${HEADERS[server]}")
 
+# ------------- OPTIONS + security headers + cookie flags -------------
+opt_hdr="$TMPDIR/opts.hdr"
+if curl_options_headers "$opt_hdr"; then
+  ALLOW_METHODS="$(grep -i '^Allow:' "$opt_hdr" | sed 's/^Allow:[ ]*//I' | tr -d '\r' | head -n1 || true)"
+fi
+
+SEC_HEADERS=( \
+  content-security-policy x-frame-options strict-transport-security \
+  cross-origin-opener-policy cross-origin-embedder-policy \
+  cross-origin-resource-policy referrer-policy permissions-policy
+)
+for k in "${SEC_HEADERS[@]}"; do
+  # try GET headers first, then OPTIONS headers
+  v="$(grep -i "^$k:" "$base_id.hdr" 2>/dev/null | sed -E 's/^[^:]+:[ ]*//' | head -n1 || true)"
+  [[ -z "$v" && -s "$opt_hdr" ]] && v="$(grep -i "^$k:" "$opt_hdr" 2>/dev/null | sed -E 's/^[^:]+:[ ]*//' | head -n1 || true)"
+  [[ -n "$v" ]] && HEADERS_SEC["$k"]="$v"
+done
+
+# first-party cookie flags
+while IFS= read -r setck; do
+  name="$(echo "$setck" | cut -d';' -f1 | sed 's/^[ ]*//')"
+  flags=""
+  IFS=';' read -ra parts <<<"$(echo "$setck" | sed 's/^.*;//')"
+  for p in "${parts[@]}"; do
+    p_trim="$(echo "$p" | sed 's/^[ ]*//' )"
+    p_low="$(echo "$p_trim" | tr '[:upper:]' '[:lower:]')"
+    case "$p_low" in
+      httponly) flags="$flags;HttpOnly";;
+      secure) flags="$flags;Secure";;
+      samesite=*) flags="$flags;SameSite=$(echo "$p_trim" | cut -d= -f2)";;
+    esac
+  done
+  COOKIE_FLAGS+=("$name$flags")
+done < <(grep -i '^Set-Cookie:' "$base_id.hdr" 2>/dev/null | sed 's/^Set-Cookie:[ ]*//I' || true)
+
 # ------------- parse links & assets (homepage only) -------------
 if command -v grep >/dev/null; then
   while IFS= read -r attr; do
     u="${attr#href=\"}"; u="${u#src=\"}"; u="${u%\"}"
     [[ -z "$u" ]] && continue
     full=$(abspath "$u")
-    # assets
-    if [[ "$u" =~ \.js($|\?)|\.css($|\?) ]]; then
-      ASSETS+=("$full")
-    fi
-    # internal links (for depth-1)
-    if [[ "$full" == ${BASE%/}/* ]]; then
-      LINKS+=("$full")
-    fi
+    if [[ "$u" =~ \.js($|\?)|\.css($|\?) ]]; then ASSETS+=("$full"); fi
+    if [[ "$full" == ${BASE%/}/* ]]; then LINKS+=("$full"); fi
   done < <(grep -Eoi '(href|src)="[^"]+"' "$base_id.body" 2>/dev/null | head -n 400)
 fi
 
@@ -137,45 +164,34 @@ ASSETS=($(printf "%s\n" "${ASSETS[@]}" | uniq_lines | head -n "$MAX_ASSETS"))
 LINKS=($(printf "%s\n" "${LINKS[@]}" | uniq_lines | head -n "$CRAWL_PAGES"))
 
 # ------------- 404 + robots + sitemap + favicon -------------
-z404_id="$TMPDIR/404"
-curl_get "${BASE}this/definitely/404" "$z404_id" >/dev/null || true
-
-robots_id="$TMPDIR/robots"
-curl_get "${BASE}robots.txt" "$robots_id" >/dev/null || true
-
-sitemap_id="$TMPDIR/sitemap"
-curl_get "${BASE}sitemap.xml" "$sitemap_id" >/dev/null || true
+z404_id="$TMPDIR/404"; curl_get "${BASE}this/definitely/404" "$z404_id" >/dev/null || true
+robots_id="$TMPDIR/robots"; curl_get "${BASE}robots.txt" "$robots_id" >/dev/null || true
+sitemap_id="$TMPDIR/sitemap"; curl_get "${BASE}sitemap.xml" "$sitemap_id" >/dev/null || true
 if [[ -s "$sitemap_id.body" ]]; then
   while IFS= read -r loc; do
-    full=$(abspath "$loc")
-    [[ "$full" == ${BASE%/}/* ]] && LINKS+=("$full")
+    full=$(abspath "$loc"); [[ "$full" == ${BASE%/}/* ]] && LINKS+=("$full")
   done < <(grep -Eo '<loc>[^<]+' "$sitemap_id.body" 2>/dev/null | sed 's/<loc>//' | head -n 100)
 fi
 LINKS=($(printf "%s\n" "${LINKS[@]}" | uniq_lines | head -n "$CRAWL_PAGES"))
 
-fav_id="$TMPDIR/fav"
-curl_get "${BASE}favicon.ico" "$fav_id" >/dev/null || true
-FAV_SHA=""
-if [[ -s "$fav_id.body" && "$(command -v sha1sum)" ]]; then
-  FAV_SHA=$(sha1sum "$fav_id.body" | awk '{print $1}')
-fi
+fav_id="$TMPDIR/fav"; curl_get "${BASE}favicon.ico" "$fav_id" >/dev/null || true
+FAV_SHA=""; if [[ -s "$fav_id.body" && "$(command -v sha1sum)" ]]; then FAV_SHA=$(sha1sum "$fav_id.body" | awk '{print $1}'); fi
 
 # ------------- scan assets for hints + sourcemaps + JS endpoints -------------
 sm_count=0
 for a in "${ASSETS[@]}"; do
   id="$TMPDIR/a$(echo -n "$a" | md5sum | cut -d' ' -f1)"
-  curl_get "$a" "$id" >/dev/null || true
+  curl_get_nc "$a" "$id" >/dev/null || true
   [[ -s "$id.body" ]] || continue
 
-  # soft Node clue: bundles that reference Node-like shims (no hypothesis flip by itself)
+  # soft Node clue
   if grep -Eq 'process\.env|globalThis\.process|module\.exports|(^|[^A-Za-z])require\(' "$id.body"; then
     SOFT_NODE_CLUE=1
   fi
 
   # version hints
   while IFS= read -r m; do
-    v=$(echo "$m" | sed -E "s/$VER_RX/\2/i")
-    [[ -n "$v" ]] && VERSION_HINTS+=("$v")
+    v=$(echo "$m" | sed -E "s/$VER_RX/\2/i"); [[ -n "$v" ]] && VERSION_HINTS+=("$v")
   done < <(grep -Eio "$VER_RX" "$id.body" 2>/dev/null || true)
 
   # sourcemap URL
@@ -200,13 +216,10 @@ done
 JS_URLS=($(printf "%s\n" "${JS_URLS[@]}" | uniq_lines))
 
 # ------------- engine probes (light) -------------
-# build candidates
 CANDS=()
 for r in "${COMMON_ROOTS[@]}"; do CANDS+=("${BASE}${r}/"); done
 for k in "${ENGINE_KEYS[@]}"; do
-  CANDS+=("${BASE}${k}")
-  CANDS+=("${BASE}api/${k}")
-  CANDS+=("${BASE}v1/${k}")
+  CANDS+=("${BASE}${k}" "${BASE}api/${k}" "${BASE}v1/${k}")
 done
 for u in "${LINKS[@]}" "${JS_URLS[@]}"; do
   low=$(echo "$u" | tr '[:upper:]' '[:lower:]')
@@ -220,8 +233,7 @@ probe_json_bad() {
   local url="$1"; local id="$TMPDIR/p$(echo -n "$url" | md5sum | cut -d' ' -f1)"
   curl_post_json "$url" "{" "$id" >/dev/null || true
   if grep -Eqi "$ENGINE_RX|$LIB_RX" "$id.body" 2>/dev/null; then
-    ERRS_KEYS+=("engine_badjson:$url")
-    ERRS_BODY["engine_badjson:$url"]="$(head -c 600 "$id.body")"
+    ERRS_KEYS+=("engine_badjson:$url"); ERRS_BODY["engine_badjson:$url"]="$(head -c 600 "$id.body")"
   fi
 }
 probe_json_keys() {
@@ -230,9 +242,7 @@ probe_json_keys() {
     local id="$TMPDIR/p$(echo -n "$url$k" | md5sum | cut -d' ' -f1)"
     curl_post_json "$url" "{\"$k\":\"(\"}" "$id" >/dev/null || true
     if grep -Eqi "$ENGINE_RX|$LIB_RX" "$id.body" 2>/dev/null; then
-      ERRS_KEYS+=("engine_json_${k}:$url")
-      ERRS_BODY["engine_json_${k}:$url"]="$(head -c 600 "$id.body")"
-      break
+      ERRS_KEYS+=("engine_json_${k}:$url"); ERRS_BODY["engine_json_${k}:$url"]="$(head -c 600 "$id.body")"; break
     fi
   done
 }
@@ -243,9 +253,7 @@ probe_raw_js() {
     echo "(" > "$id.data"
     curl_post "$url" "Content-Type: $ct" "$id" >/dev/null || true
     if grep -Eqi "$ENGINE_RX|$LIB_RX" "$id.body" 2>/dev/null; then
-      ERRS_KEYS+=("engine_raw_${ct}:$url")
-      ERRS_BODY["engine_raw_${ct}:$url"]="$(head -c 600 "$id.body")"
-      break
+      ERRS_KEYS+=("engine_raw_${ct}:$url"); ERRS_BODY["engine_raw_${ct}:$url"]="$(head -c 600 "$id.body")"; break
     fi
   done
 }
@@ -253,8 +261,7 @@ probe_get_json() {
   local url="$1"; local id="$TMPDIR/g$(echo -n "$url" | md5sum | cut -d' ' -f1)"
   curl -ksS -m "$TIMEOUT" -A "$UA" -H "Accept: application/json" -D "$id.hdr" -o "$id.body" "$url" >/dev/null || true
   if grep -Eqi "$ENGINE_RX|$LIB_RX" "$id.body" 2>/dev/null; then
-    ERRS_KEYS+=("engine_get:$url")
-    ERRS_BODY["engine_get:$url"]="$(head -c 600 "$id.body")"
+    ERRS_KEYS+=("engine_get:$url"); ERRS_BODY["engine_get:$url"]="$(head -c 600 "$id.body")"
   fi
 }
 
@@ -267,19 +274,12 @@ done
 
 # collect engine markers from error bodies
 for k in "${ERRS_KEYS[@]}"; do
-  if echo "${ERRS_BODY[$k]}" | grep -Eqi "$ENGINE_RX"; then
-    ENGINE_MARKERS+=("$k")
-  fi
-  # hard Node signal via vm2/contextify errors
-  if echo "${ERRS_BODY[$k]}" | grep -Eqi 'vm2|contextify'; then
-    NODE_HARD_HINT=1
-  fi
+  if echo "${ERRS_BODY[$k]}" | grep -Eqi "$ENGINE_RX"; then ENGINE_MARKERS+=("$k"); fi
+  if echo "${ERRS_BODY[$k]}" | grep -Eqi 'vm2|contextify'; then NODE_HARD_HINT=1; fi
 done
 
 # ------------- cookies / headers -> hits -------------
-if [[ -n "${HEADERS[server]:-}" ]]; then
-  HITS_HEADER+=("server:${HEADERS[server]}")
-fi
+[[ -n "${HEADERS[server]:-}" ]] && HITS_HEADER+=("server:${HEADERS[server]}")
 for c in "${COOKIES[@]}"; do
   low=$(echo "$c" | tr '[:upper:]' '[:lower:]')
   case "$low" in
@@ -289,29 +289,17 @@ for c in "${COOKIES[@]}"; do
 done
 
 # ------------- quick hypotheses (simple rules) -------------
-HYPOS=()   # lines like "engine:js2py" or "framework:flask"
-
-# engine hints (from captured error bodies or sourcemaps)
-if printf "%s\n" "${ERRS_BODY[@]}" "${SOURCEMAPS_CONTENT[@]}" | grep -Eqi 'js2py';   then HYPOS+=("engine:js2py [high]");   fi
+HYPOS=()
+if printf "%s\n" "${ERRS_BODY[@]}" "${SOURCEMAPS_CONTENT[@]}" | grep -Eqi 'js2py';   then HYPOS+=("engine:js2py [high]"); fi
 if printf "%s\n" "${ERRS_BODY[@]}" "${SOURCEMAPS_CONTENT[@]}" | grep -Eqi 'quickjs'; then HYPOS+=("engine:quickjs [med]");  fi
-
-# server/framework hints
 if grep -Eqi 'gunicorn|uvicorn|hypercorn' "$base_id.hdr"; then HYPOS+=("server:python_asgi_wsgi [med]"); fi
-# Node: use only hard hints to avoid FPs; soft clue goes to rationale
-if [[ $NODE_HARD_HINT -eq 1 ]]; then
-  HYPOS+=("framework:nodejs [high]")
-fi
-
+if [[ $NODE_HARD_HINT -eq 1 ]]; then HYPOS+=("framework:nodejs [high]"); fi
 mapfile -t HYPOS < <(printf '%s\n' "${HYPOS[@]}" | uniq_lines)
 
 # ------------- context (offline) -------------
-RAT=()
-NHUNTS=()
-QUERIES=()
-CVESEED=()
-
+RAT=(); NHUNTS=(); QUERIES=(); CVESEED=()
 [[ -n "${HEADERS[server]:-}" ]] && RAT+=("Headers suggest: server: ${HEADERS[server]}")
-if [[ -n "${HEADERS[x_powered_by]:-}" ]]; then RAT+=("X-Powered-By: ${HEADERS[x_powered_by]}"); fi
+[[ -n "${HEADERS[x_powered_by]:-}" ]] && RAT+=("X-Powered-By: ${HEADERS[x_powered_by]}")
 if [[ "${#HITS_COOKIE[@]}" -gt 0 ]]; then
   cookie_names=$(printf "%s\n" "${HITS_COOKIE[@]}" | sed 's/;.*//' | awk -F= '{print $1}' | paste -sd' ' -)
   RAT+=("Cookies seen: ${cookie_names}")
@@ -320,7 +308,6 @@ if [[ "${#ENGINE_MARKERS[@]}" -gt 0 ]]; then
   markers=$(printf "%s\n" "${ENGINE_MARKERS[@]}" | sed 's/engine_[^:]*://g' | paste -sd' ' -)
   RAT+=("Engine markers: ${markers}")
 fi
-# reflect soft Node clue only as context
 if [[ $SOFT_NODE_CLUE -eq 1 && $NODE_HARD_HINT -eq 0 ]]; then
   RAT+=("Frontend bundles reference Node-like shims (soft hint only).")
 fi
@@ -328,35 +315,14 @@ fi
 # version hints from base html
 if [[ -s "$base_id.body" ]]; then
   while IFS= read -r m; do
-    v=$(echo "$m" | sed -E "s/$VER_RX/\2/i")
-    [[ -n "$v" ]] && VERSION_HINTS+=("$v")
+    v=$(echo "$m" | sed -E "s/$VER_RX/\2/i"); [[ -n "$v" ]] && VERSION_HINTS+=("$v")
   done < <(grep -Eio "$VER_RX" "$base_id.body" 2>/dev/null || true)
 fi
 VERSION_HINTS=($(printf "%s\n" "${VERSION_HINTS[@]}" | uniq_lines))
 
-# ------------- enrich by detected hypos (modular, generic-first) -------------
-has_hypo() {  # match ignoring confidence tag
-  local needle="$1"
-  for h in "${HYPOS[@]}"; do
-    base="${h%% *}"     # strip " [high]" etc.
-    if [[ "$base" == "$needle" ]]; then return 0; fi
-  done
-  return 1
-}
-
-# Helper to add unique lines (no splitting)
-add_unique_line() {
-  local what="$1"; shift
-  local line="$*"
-  case "$what" in
-    RAT)    RAT+=("$line");;
-    NHUNTS) NHUNTS+=("$line");;
-    QUERIES)QUERIES+=("$line");;
-    CVESEED)CVESEED+=("$line");;
-  esac
-}
-
-# --- Engine-specific enrichers (keep targeted, but not over-tuned) ---
+# enrichers (unchanged from your working copy)
+has_hypo() { local needle="$1"; for h in "${HYPOS[@]}"; do base="${h%% *}"; [[ "$base" == "$needle" ]] && return 0; done; return 1; }
+add_unique_line(){ local what="$1"; shift; local line="$*"; case "$what" in RAT)RAT+=("$line");;NHUNTS)NHUNTS+=("$line");;QUERIES)QUERIES+=("$line");;CVESEED)CVESEED+=("$line");;esac; }
 
 if has_hypo "engine:js2py"; then
   add_unique_line RAT "engine:js2py: Python-side JS eval; sandbox escapes have existed."
@@ -367,7 +333,6 @@ if has_hypo "engine:js2py"; then
   add_unique_line QUERIES "js2py vulnerability CVE"
   add_unique_line CVESEED "CVE-2024-28397"
 fi
-
 if has_hypo "engine:quickjs"; then
   add_unique_line RAT "engine:quickjs: embedded JS engine (often via wrappers/bindings)."
   add_unique_line NHUNTS "Probe raw-JS POSTs; check for QuickJS-looking stack frames in error bodies."
@@ -375,39 +340,27 @@ if has_hypo "engine:quickjs"; then
   add_unique_line QUERIES "quickjs sandbox escape"
   add_unique_line QUERIES "quickjs RCE CVE"
 fi
-
-# Generic engine fallback (covers other engines or unknown eval services)
 if grep -q "^engine:" <(printf "%s\n" "${HYPOS[@]}" | sed 's/ \[.*\]$//'); then
   add_unique_line NHUNTS "Map any /eval|/execute|/expr|/script endpoints; prefer JSON with {expr:'('} to elicit parser traces."
   add_unique_line NHUNTS "Try text/javascript vs application/json bodies; compare error signatures."
   add_unique_line QUERIES "server-side javascript engine sandbox"
 fi
-
-# --- Framework/server enrichers (generic + common stacks) ---
-
-# Python ASGI/WSGI (gunicorn/uvicorn/hypercorn)
 if has_hypo "server:python_asgi_wsgi"; then
   add_unique_line RAT "Python ASGI/WSGI backend (gunicorn/uvicorn/hypercorn)."
   add_unique_line NHUNTS "Correlate cookies (sessionid/csrftoken) to distinguish Django vs Flask."
   add_unique_line QUERIES "python asgi wsgi identify framework"
 fi
-
-# Flask (already pretty solid)
 if has_hypo "framework:flask"; then
   add_unique_line RAT "framework:flask: Jinja2 SSTI risks if misused."
   add_unique_line NHUNTS "Check error pages; harmless '{{7*7}}' in reflected inputs (read-only)."
   add_unique_line QUERIES "Flask Jinja2 SSTI cheat sheet"
 fi
-
-# Django (derive from cookies or page hints if you also emit it)
 if has_hypo "framework:django"; then
   add_unique_line RAT "framework:django: CSRF baked-in; urls like /admin/, cookies 'csrftoken'/'sessionid'."
   add_unique_line NHUNTS "Probe /admin/ (200/302/403 is still a fingerprint)."
   add_unique_line NHUNTS "Look for 'csrfmiddlewaretoken' in forms; confirm version via /static/admin/ assets."
   add_unique_line QUERIES "Django version fingerprint static admin"
 fi
-
-# Node.js (use hard hints only in HYPOS; soft clues go to rationale earlier)
 if has_hypo "framework:nodejs"; then
   add_unique_line RAT "framework:nodejs: check X-Powered-By (express/koa/fastify) and 'connect.sid' cookies."
   add_unique_line NHUNTS "If a 'code-run' endpoint exists, differentiate engines: send small JS to reveal 'typeof process'."
@@ -415,20 +368,12 @@ if has_hypo "framework:nodejs"; then
   add_unique_line QUERIES "express identify headers"
   add_unique_line QUERIES "vm2 sandbox escape patterns"
 fi
-
-# --- Always-on, low-noise generic hunts (apply regardless of stack) ---
 add_unique_line NHUNTS "Check security headers via OPTIONS / and GET /: CSP, X-Frame-Options, HSTS, COOP/COEP/CORP."
 add_unique_line NHUNTS "List allowed methods on likely endpoints; note unexpected PUT/PATCH/DELETE."
 add_unique_line QUERIES "web app fingerprinting checklist"
 add_unique_line QUERIES "security headers best practices"
 
-# generic queries for each hypo
-for h in "${HYPOS[@]}"; do
-  t="${h#*:}"               # drop kind:
-  t="${t%% *}"              # drop confidence tag
-  QUERIES+=("$t vulnerability CVE")
-done
-# preserve whole lines (no word splitting)
+for h in "${HYPOS[@]}"; do t="${h#*:}"; t="${t%% *}"; QUERIES+=("$t vulnerability CVE"); done
 mapfile -t QUERIES < <(printf '%s\n' "${QUERIES[@]}" | awk 'NF' | uniq_lines | head -n 8)
 mapfile -t NHUNTS  < <(printf '%s\n' "${NHUNTS[@]}"  | awk 'NF' | uniq_lines | head -n 8)
 mapfile -t RAT     < <(printf '%s\n' "${RAT[@]}"     | awk 'NF' | uniq_lines | head -n 6)
@@ -442,10 +387,24 @@ print_kv "Target" "$BASE"
 [[ -n "${HEADERS[x_powered_by]:-}" ]] && print_kv "X-Powered-By" "${HEADERS[x_powered_by]}"
 [[ -n "${HEADERS[content_type]:-}" ]] && print_kv "Content-Type" "${HEADERS[content_type]}"
 [[ -n "$FAV_SHA" ]] && print_kv "Favicon (sha1)" "$FAV_SHA"
+[[ -n "${ALLOW_METHODS:-}" ]] && print_kv "Allow (OPTIONS /)" "$ALLOW_METHODS"
+
+if [[ ${HEADERS_SEC+set} == set ]] && ((${#HEADERS_SEC[@]})); then
+  echo -e "\n**Security headers (GET/OPTIONS):**"
+  for k in "${!HEADERS_SEC[@]}"; do
+    printf "- %s: %s\n" "$k" "${HEADERS_SEC[$k]}"
+  done
+fi
+
 
 if [[ "${#COOKIES[@]}" -gt 0 ]]; then
   names=$(printf "%s\n" "${COOKIES[@]}" | sed 's/;.*//' | awk -F= '{print $1}' | paste -sd' ' -)
   echo -e "\n**Cookies (names):** $names"
+fi
+
+if [[ "${#COOKIE_FLAGS[@]}" -gt 0 ]]; then
+  echo -e "\n**Cookie flags (first-party):**"
+  for c in "${COOKIE_FLAGS[@]}"; do echo "- $c"; done
 fi
 
 if [[ "${#ASSETS[@]}" -gt 0 ]]; then
@@ -455,9 +414,7 @@ fi
 
 if [[ "${#SOURCEMAPS[@]}" -gt 0 ]]; then
   echo -e "\n**Sourcemaps (sample):**"
-  for i in "${!SOURCEMAPS[@]}"; do
-    echo "- ${SOURCEMAPS[$i]}"
-  done
+  for i in "${!SOURCEMAPS[@]}"; do echo "- ${SOURCEMAPS[$i]}"; done
 fi
 
 if [[ "${#VERSION_HINTS[@]}" -gt 0 ]]; then
@@ -490,6 +447,7 @@ if [[ "${#RAT[@]}" -gt 0 || "${#NHUNTS[@]}" -gt 0 || "${#QUERIES[@]}" -gt 0 || "
     echo "**Rationale**"
     for r in "${RAT[@]}"; do echo "- $r"; done
   fi
+  # (keep these commented to stay lean)
   # if [[ "${#NHUNTS[@]}" -gt 0 ]]; then
   #   echo -e "\n**Next hunts**"
   #   for h in "${NHUNTS[@]}"; do echo "- $h"; done
