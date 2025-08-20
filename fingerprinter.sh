@@ -379,8 +379,30 @@ mapfile -t NHUNTS  < <(printf '%s\n' "${NHUNTS[@]}"  | awk 'NF' | uniq_lines | h
 mapfile -t RAT     < <(printf '%s\n' "${RAT[@]}"     | awk 'NF' | uniq_lines | head -n 6)
 mapfile -t CVESEED < <(printf '%s\n' "${CVESEED[@]}" | awk 'NF' | uniq_lines | head -n 8)
 
+# ------------- CMS quick targets -------------
+CMS_HITS=()
+
+# Drupal / Backdrop
+if curl -fsS "${BASE}" | grep -qi 'meta name="generator"'; then CMS_HITS+=("drupal/backdrop: meta generator tag"); fi
+if curl -sI "${BASE}" | grep -qi '^X-Generator'; then CMS_HITS+=("drupal/backdrop: X-Generator header"); fi
+if curl -fsS "${BASE}core/CHANGELOG.txt" | grep -qi drupal; then CMS_HITS+=("drupal: core/CHANGELOG.txt exposed"); fi
+if curl -fsS "${BASE}CHANGELOG.txt" | grep -qi drupal; then CMS_HITS+=("drupal: 7.x CHANGELOG.txt exposed"); fi
+
+# WordPress
+if curl -fsS "${BASE}readme.html" | grep -qi wordpress; then CMS_HITS+=("wordpress: readme.html"); fi
+if curl -fsS "${BASE}wp-includes/version.php" | grep -q '\$wp_version'; then CMS_HITS+=("wordpress: wp-includes/version.php"); fi
+
+# Joomla
+if curl -fsS "${BASE}README.txt" | grep -qi joomla; then CMS_HITS+=("joomla: README.txt"); fi
+if curl -fsS "${BASE}language/en-GB/en-GB.xml" | grep -qi version; then CMS_HITS+=("joomla: language XML version"); fi
+
+# Generic PHP apps (version hints)
+php_ver=$(curl -fsS "${BASE}" | grep -Eio 'v[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -Vu | tail -n1 || true)
+if [[ -n "$php_ver" ]]; then CMS_HITS+=("generic-php: version string $php_ver"); fi
+
+
 # ------------- report (Markdown) -------------
-echo "# Web Fingerprinter (curl edition)"
+echo "# Web Fingerprinter"
 print_kv "Target" "$BASE"
 [[ -n "$TITLE" ]] && print_kv "Title" "$TITLE"
 [[ -n "${HEADERS[server]:-}" ]] && print_kv "Server" "${HEADERS[server]}"
@@ -425,6 +447,12 @@ if [[ "${#JS_URLS[@]}" -gt 0 ]]; then
   echo -e "\n**JS Endpoints (from frontend):**"
   for u in "${JS_URLS[@]}"; do echo "- $u"; done
 fi
+
+if [[ "${#CMS_HITS[@]}" -gt 0 ]]; then
+  echo -e "\n**CMS quick hits:**"
+  for c in "${CMS_HITS[@]}"; do echo "- $c"; done
+fi
+
 
 if [[ "${#HYPOS[@]}" -gt 0 ]]; then
   echo -e "\n## Hypotheses"
