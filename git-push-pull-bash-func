@@ -1,0 +1,38 @@
+# Pull in all first-level git repos under the current directory
+git_pull() {
+  local base="${1:-.}"
+  shopt -s nullglob
+  for dir in "$base"/*/; do
+    [[ -d "$dir/.git" ]] || continue
+    echo -e "\n==> Pulling: $dir"
+    (cd "$dir" && git pull --ff-only || echo "   (pull failed in $(basename "$dir"))")
+  done
+}
+
+# Add/commit/push in all first-level git repos under the current directory
+# Usage: git_push_here "end workflow"
+git_push() {
+  local base="${1:-.}"
+  local msg="${2:-end workflow}"
+  shopt -s nullglob
+  for dir in "$base"/*/; do
+    [[ -d "$dir/.git" ]] || continue
+    echo -e "\n==> Pushing: $dir"
+    (
+      cd "$dir" || exit 1
+      # Only commit if there are changes (tracked or untracked)
+      if [[ -n "$(git status --porcelain)" ]]; then
+        git add -A
+        git commit -m "$msg" || true  # avoid stopping on "nothing to commit"
+      else
+        echo "   No changes to commit."
+      fi
+      # Push if branch has an upstream; otherwise, hint
+      if git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then
+        git push || echo "   (push failed)"
+      else
+        echo "   No upstream set. Run: git push -u origin HEAD"
+      fi
+    )
+  done
+}
