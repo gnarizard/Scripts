@@ -1,4 +1,5 @@
 # Pull in all first-level git repos under the current directory
+# Usage: git_pull
 git_pull() {
   local base="${1:-.}"
   shopt -s nullglob
@@ -10,7 +11,7 @@ git_pull() {
 }
 
 # Add/commit/push in all first-level git repos under the current directory
-# Usage: git_push_here "end workflow"
+# Usage: git_push "end workflow"
 git_push() {
   local base="${1:-.}"
   local msg="${2:-end workflow}"
