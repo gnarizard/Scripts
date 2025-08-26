@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # fingerprinter.sh — ultra-light web fingerprinting via curl
 # Usage:
-#   export DOMAIN=example.com; export PORT=8000
-#   ./fingerprinter.sh                # defaults to http://DOMAIN:PORT/
-#   (optional) export SCHEME=https    # use https
+#   export DOMAIN=example.com
+#   ./fingerprinter.sh                 # defaults to http://DOMAIN:80/
+#   ./fingerprinter.sh -p 8080         # override port
+#   (optional) export SCHEME=https     # use https
 # Notes: read-only probes; outputs Markdown to stdout.
 
 set -euo pipefail
@@ -11,20 +12,36 @@ set -euo pipefail
 # ------------- config (ENV ONLY) -------------
 SCHEME="${SCHEME:-http}"
 HOST="${DOMAIN:-${IP:-}}"
-PORT="${PORT:-}"
+PORT="${PORT:-80}"                # default to 80 if not set
 TIMEOUT=8
 MAX_ASSETS=12
-ENGINE_PROBES=18            # cap engine endpoint guesses
-CRAWL_PAGES=6               # depth-1 pages to fetch (links found on /)
+ENGINE_PROBES=18                 # cap engine endpoint guesses
+CRAWL_PAGES=6                    # depth-1 pages to fetch (links found on /)
 UA="webfp/0.4 (+read-only curl probes)"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Require env vars
-if [[ -z "${HOST}" || -z "${PORT}" ]]; then
-  echo "[-] Please export DOMAIN (or IP) and PORT before running." >&2
-  echo "    export DOMAIN=codetwo.htb; export PORT=8000" >&2
-  echo "    ./fingerprinter.sh" >&2
+# ------------- arg parsing (port override) -------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--port)
+      if [[ -n "${2-}" ]]; then PORT="$2"; shift 2; else echo "[-] Missing value for $1" >&2; exit 1; fi
+      ;;
+    -h|--help)
+      echo "Usage: DOMAIN=example.com [SCHEME=http|https] ./fingerprinter.sh [-p PORT]" >&2
+      exit 0
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+# ------------- require env vars -------------
+if [[ -z "${HOST}" ]]; then
+  echo "[-] Please export DOMAIN (or IP) before running." >&2
+  echo "    export DOMAIN=example.com" >&2
+  echo "    ./fingerprinter.sh [-p 8080]" >&2
   exit 1
 fi
 
